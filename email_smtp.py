@@ -3,7 +3,7 @@ import smtplib
 from email.message import EmailMessage
 
 
-def send_email_gmail_smtp(subject: str, body_text: str) -> None:
+def send_email_gmail_smtp(subject: str, body_text: str, body_html: str | None = None) -> None:
     """
     Send an email via Gmail SMTP.
 
@@ -26,16 +26,20 @@ def send_email_gmail_smtp(subject: str, body_text: str) -> None:
     msg["Subject"] = subject
     msg["From"] = email_from
     msg["To"] = email_to
+
+    # Plain-text fallback (always)
     msg.set_content(body_text)
+
+    # HTML version (optional)
+    if body_html:
+        msg.add_alternative(body_html, subtype="html")
 
     try:
         if mode == "ssl":
-            # Gmail SSL SMTP
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
                 server.login(smtp_user, smtp_pass)
                 server.send_message(msg)
         else:
-            # Gmail STARTTLS SMTP
             with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
                 server.ehlo()
                 server.starttls()
@@ -44,7 +48,6 @@ def send_email_gmail_smtp(subject: str, body_text: str) -> None:
                 server.send_message(msg)
 
     except smtplib.SMTPAuthenticationError as e:
-        # Common Gmail failure: not using an App Password or wrong account
         raise RuntimeError(
             "Gmail SMTP auth failed (535). Most common causes:\n"
             " - SMTP_PASS is NOT a Google App Password (it must be a 16-char app password)\n"
