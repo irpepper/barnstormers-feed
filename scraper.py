@@ -544,25 +544,11 @@ def main() -> int:
         except Exception as e:
             print(f"WARN: Failed to process {url}: {e}", file=sys.stderr)
 
-    new_ads = [ad for ad_id, ad in all_ads.items() if ad_id not in seen]
+        new_ads = [ad for ad_id, ad in all_ads.items() if ad_id not in seen]
 
     if not new_ads:
         print("No new ads.")
         return 0
-    
-    # Apply minimum price filter
-    if MIN_PRICE > 0:
-        filtered: List[AdDetail] = []
-        for ad in details:
-            val = parse_price_value(ad.price)
-            if val is None:
-                # keep listings with no price (optional; see note below)
-                filtered.append(ad)
-            elif val >= MIN_PRICE:
-                filtered.append(ad)
-
-        details = filtered
-
 
     new_ads = sort_newest_first(new_ads)
 
@@ -578,26 +564,49 @@ def main() -> int:
             print(f"WARN: Failed to enrich {ad.url}: {e}", file=sys.stderr)
             details.append(ad)
 
-    # After building `details`
+    # Apply minimum price filter (MIN_PRICE)
+    if MIN_PRICE > 0:
+        filtered: List[AdDetail] = []
+        for ad in details:
+            val = parse_price_value(ad.price)
+            if val is None:
+                # keep listings with no price (change to 'continue' to drop)
+                filtered.append(ad)
+            elif val >= MIN_PRICE:
+                filtered.append(ad)
+        details = filtered
+
+    # If everything got filtered out, don't email; still mark as seen so you don't keep reprocessing
+    if not details:
+        print(f"No new ads after filtering (MIN_PRICE={MIN_PRICE}).")
+        seen.update(ad.ad_id for ad in new_ads)
+        trimmed = trim_seen_ids(seen, SEEN_CAP)
+        save_seen(SEEN_FILE, trimmed)
+        print(f"Updated {SEEN_FILE} (kept {len(trimmed)} ids).")
+        return 0
+
+    # Sort email cards by quality (best first)
     details = sort_best_first(details)
 
-    text_body = build_digest_text(new_ads)   # still newest-first if you want
-    html_body = build_digest_html(details)   # best listings first
-
+    # Text fallback can still be newest-first or also quality-sorted; your call.
+    text_body = build_digest_text(new_ads)
+    html_body = build_digest_html(details)
 
     send_email_gmail_smtp(
-        subject=f"Barnstormers: {len(new_ads)} new listings",
+        subject=f"Barnstormers: {len(details)} new listings",
         body_text=text_body,
         body_html=html_body,
     )
     print("Email sent via Gmail SMTP.")
 
+    # Update seen IDs (mark ALL new_ads as seen, even if filtered out, to prevent repeat noise)
     seen.update(ad.ad_id for ad in new_ads)
     trimmed = trim_seen_ids(seen, SEEN_CAP)
     save_seen(SEEN_FILE, trimmed)
     print(f"Updated {SEEN_FILE} (kept {len(trimmed)} ids).")
 
     return 0
+
 
 
 if __name__ == "__main__":
