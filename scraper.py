@@ -16,6 +16,7 @@ BASE = "https://www.barnstormers.com"
 MAX_EMAIL_ITEMS = int(os.getenv("MAX_EMAIL_ITEMS", "50"))   # cap email size
 SEEN_CAP = int(os.getenv("SEEN_CAP", "3000"))              # cap stored IDs
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))  # seconds
+MIN_PRICE = float(os.getenv("MIN_PRICE", "0"))  # USD, e.g. 50000
 
 URLS_FILE = os.getenv("URLS_FILE", "urls.txt")
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
@@ -117,6 +118,17 @@ def normalize_money(val: str) -> str:
         s = "$" + s
     return s
 
+def parse_price_value(price: Optional[str]) -> Optional[float]:
+    """
+    Convert "$160,000.00" -> 160000.0
+    Returns None if price is missing or unparseable.
+    """
+    if not price:
+        return None
+    try:
+        return float(price.replace("$", "").replace(",", "").strip())
+    except Exception:
+        return None
 
 def clean_desc(text: str) -> str:
     if not text:
@@ -491,7 +503,7 @@ def build_digest_html(details: List[AdDetail]) -> str:
     <div style="max-width:680px;margin:0 auto;padding:14px 10px;font-family:Arial,sans-serif;">
       <div style="font-size:20px;font-weight:900;color:#111;">Barnstormers: {len(details)} new listings</div>
       <div style="font-size:12px;color:#666;margin-top:4px;">
-        Marketplace-style cards (2-column on desktop, stacked on mobile). Tap “Read more” for full details.
+        Filters: minimum price ${int(MIN_PRICE):,}
       </div>
     </div>
     """
@@ -537,6 +549,20 @@ def main() -> int:
     if not new_ads:
         print("No new ads.")
         return 0
+    
+    # Apply minimum price filter
+    if MIN_PRICE > 0:
+        filtered: List[AdDetail] = []
+        for ad in details:
+            val = parse_price_value(ad.price)
+            if val is None:
+                # keep listings with no price (optional; see note below)
+                filtered.append(ad)
+            elif val >= MIN_PRICE:
+                filtered.append(ad)
+
+        details = filtered
+
 
     new_ads = sort_newest_first(new_ads)
 

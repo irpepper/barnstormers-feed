@@ -32,9 +32,11 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           # Optional override:
           # EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-          MAX_EMAIL_ITEMS: "50"
+          MAX_EMAIL_ITEMS: "200"
           SEEN_CAP: "3000"
           REQUEST_TIMEOUT: "30"
+          MIN_PRICE: "25000"
+
         run: |
           python scraper.py
 
