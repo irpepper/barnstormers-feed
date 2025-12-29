@@ -90,6 +90,7 @@ PRICE_RE = re.compile(r"\bPrice\s+([\d,]+(?:\.\d{2})?)\b", re.IGNORECASE)
 POSTED_RE = re.compile(r"\bPosted\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})\b")
 LOC_IN_BODY_RE = re.compile(r"\b([A-Za-z .'-]+,\s*[A-Z]{2})\b")  # "Bisbee, AZ"
 LOC_IN_CONTACT_RE = re.compile(r"\blocated\s+(.+?)\s+United States\b", re.IGNORECASE)
+DOLLAR_RE = re.compile(r"\$\s*[\d,]+(?:\.\d{2})?")
 
 def thumbnail_to_large(url: str) -> str:
     """
@@ -152,11 +153,29 @@ def parse_classified_single(div) -> Optional[AdDetail]:
     description = clean_desc(body_span.get_text("\n", strip=True)) if body_span else None
 
     # price from description
+    # price: prefer explicit <span class="price">...</span> if present
     price = None
-    if description:
-        m = PRICE_RE.search(description)
-        if m:
-            price = normalize_money(m.group(1))
+
+    price_span = div.find("span", class_="price")
+    if price_span:
+        raw = price_span.get_text(" ", strip=True)
+        m0 = DOLLAR_RE.search(raw or "")
+        if m0:
+            price = m0.group(0).replace(" ", "")
+
+    # fallback: "Price 160,000.00" inside description
+    if not price and description:
+        m1 = PRICE_RE.search(description)
+        if m1:
+            price = normalize_money(m1.group(1))
+
+    # fallback: any $... pattern anywhere in the listing block
+    if not price:
+        div_text = div.get_text(" ", strip=True)
+        m2 = DOLLAR_RE.search(div_text or "")
+        if m2:
+            price = m2.group(0).replace(" ", "")
+
 
     # posted from whole div text
     posted = None
@@ -204,6 +223,80 @@ def parse_classified_single(div) -> Optional[AdDetail]:
         description=description,
         images=tuple(images),
     )
+
+ENGINE_RE = re.compile(r"\b(O|IO)-\s?(320|360|340|375|390)\b", re.IGNORECASE)
+IFR_RE = re.compile(r"\bIFR\b", re.IGNORECASE)
+AP_RE = re.compile(r"\bautopilot\b|\bAP\b", re.IGNORECASE)
+FP_RE = re.compile(r"\bfixed pitch\b|\bground adjustable\b|\bsensenich\b", re.IGNORECASE)
+CS_RE = re.compile(r"\bconstant speed\b|\bCS prop\b|\bhartzell\b|\bgovernor\b", re.IGNORECASE)
+
+def listing_quality_score(ad: AdDetail) -> int:
+    """
+    Higher is better. Tuned for your goals:
+    - photos + price + real description + location = most important
+    - attribute extraction (engine, IFR, AP, prop) = bonus
+    """
+    score = 0
+
+    # Photos: strong signal
+    n_imgs = len(ad.images or ())
+    if n_imgs >= 1:
+        score += 35
+    if n_imgs >= 3:
+        score += 10
+    if n_imgs >= 5:
+        score += 5
+
+    # Price: strong signal
+    if ad.price:
+        score += 25
+
+    # Location: helpful
+    if ad.location:
+        score += 10
+
+    # Description: quality by length
+    desc = (ad.description or "").strip()
+    if len(desc) >= 40:
+        score += 15
+    if len(desc) >= 200:
+        score += 10
+    if len(desc) >= 600:
+        score += 5
+
+    # Attribute bonuses (from title+desc)
+    blob = f"{ad.title} {desc}"
+
+    if ENGINE_RE.search(blob):
+        score += 10
+    if IFR_RE.search(blob):
+        score += 5
+    if AP_RE.search(blob):
+        score += 5
+
+    # Prop type bonus (either direction is useful info)
+    if FP_RE.search(blob):
+        score += 3
+    if CS_RE.search(blob):
+        score += 3
+
+    # Posted date present is mildly useful
+    if ad.posted:
+        score += 2
+
+    return score
+
+
+def sort_best_first(ads: List[AdDetail]) -> List[AdDetail]:
+    """
+    Sort primarily by listing quality, then by newest ad_id.
+    """
+    return sorted(
+        ads,
+        key=lambda a: (listing_quality_score(a), int(a.ad_id)),
+        reverse=True,
+    )
+
 
 
 def extract_ads_from_listing_page(html: str) -> Dict[str, AdDetail]:
@@ -357,8 +450,8 @@ def render_card(ad: AdDetail) -> str:
         {hero_html}
 
         <div style="padding:10px 2px 2px;font-family:Arial,sans-serif;">
-          <div style="font-size:20px;font-weight:800;color:#111;line-height:1.15;">{price}</div>
-          <div style="font-size:14px;font-weight:700;color:#222;margin-top:4px;">{title}</div>
+          <div style="font-size:18px;font-weight:900;color:#111;line-height:1.15;">{title}</div>
+          <div style="font-size:14px;font-weight:700;color:#1f1f1f;margin-top:2px;">{price}</div>
 
           <div style="font-size:12px;color:#666;margin-top:6px;">{html_escape(meta_line)}</div>
           <div style="font-size:12px;color:#666;margin-top:6px;">{chips}</div>
@@ -459,8 +552,12 @@ def main() -> int:
             print(f"WARN: Failed to enrich {ad.url}: {e}", file=sys.stderr)
             details.append(ad)
 
-    text_body = build_digest_text(new_ads)
-    html_body = build_digest_html(details)
+    # After building `details`
+    details = sort_best_first(details)
+
+    text_body = build_digest_text(new_ads)   # still newest-first if you want
+    html_body = build_digest_html(details)   # best listings first
+
 
     send_email_gmail_smtp(
         subject=f"Barnstormers: {len(new_ads)} new listings",
