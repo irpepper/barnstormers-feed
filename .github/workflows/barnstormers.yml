@@ -1,16 +1,15 @@
-name: RV Listings Scraper
+name: Barnstormers Digest (Gmail SMTP)
 
 on:
   schedule:
-    # Run once daily at 2 AM UTC
-    - cron: "0 2 * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}
 
 permissions:
-  contents: write  # allow committing scraped listings
+  contents: write  # allow committing updated seen.json
 
 jobs:
-  scrape:
+  run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -28,13 +27,20 @@ jobs:
 
       - name: Run scraper
         env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          # Optional override:
+          # EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          MAX_EMAIL_ITEMS: "200"
+          SEEN_CAP: "3000"
           REQUEST_TIMEOUT: "30"
-          STORAGE_DIR: "listings"
+          MIN_PRICE: "25000"
 
         run: |
           python scraper.py
 
-      - name: Commit scraped listings (if changed)
+      - name: Commit updated seen.json (if changed)
         run: |
           if git diff --quiet; then
             echo "No changes to commit."
@@ -44,6 +50,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add listings/
-          git commit -m "Update scraped listings [skip ci]"
+          git add seen.json
+          git commit -m "Update seen listings"
           git push
