@@ -21,6 +21,27 @@ MIN_PRICE = float(os.getenv("MIN_PRICE", "0"))  # USD, e.g. 50000
 URLS_FILE = os.getenv("URLS_FILE", "urls.txt")
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
 
+# Title substrings (case-insensitive) that mark an ad as a recurring service
+# listing rather than an actual aircraft/part for sale, so it's dropped before
+# ever reaching "new" or the digest. Extend via BLACKLIST_KEYWORDS env var
+# (comma-separated) without touching code.
+DEFAULT_BLACKLIST_TITLE_KEYWORDS = [
+    "faa ac trust",  # e.g. "FAA AC TRUST and N REGISTRATION" spam/service ad
+]
+BLACKLIST_TITLE_KEYWORDS = [
+    kw.strip().lower()
+    for kw in (
+        DEFAULT_BLACKLIST_TITLE_KEYWORDS
+        + os.getenv("BLACKLIST_KEYWORDS", "").split(",")
+    )
+    if kw.strip()
+]
+
+
+def is_blacklisted(title: str) -> bool:
+    blob = (title or "").lower()
+    return any(kw in blob for kw in BLACKLIST_TITLE_KEYWORDS)
+
 
 # ---------- Models ----------
 
@@ -539,6 +560,10 @@ def main() -> int:
         try:
             html = fetch(url)
             ads = extract_ads_from_listing_page(html)
+            blacklisted = {aid: ad for aid, ad in ads.items() if is_blacklisted(ad.title)}
+            for ad in blacklisted.values():
+                print(f"Blacklisted: {ad.title} ({ad.url})")
+            ads = {aid: ad for aid, ad in ads.items() if aid not in blacklisted}
             all_ads.update(ads)  # cross-category dedupe by ad_id
             print(f"Fetched {url}: {len(ads)} ads")
         except Exception as e:
