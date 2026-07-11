@@ -33,7 +33,7 @@ jobs:
           # Optional override:
           # EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           MAX_EMAIL_ITEMS: "200"
-          SEEN_CAP: "3000"
+          SEEN_CAP: "50000"
           REQUEST_TIMEOUT: "30"
           MIN_PRICE: "25000"
 

@@ -14,7 +14,7 @@ BASE = "https://www.barnstormers.com"
 
 # Config knobs (optional env overrides)
 MAX_EMAIL_ITEMS = int(os.getenv("MAX_EMAIL_ITEMS", "50"))   # cap email size
-SEEN_CAP = int(os.getenv("SEEN_CAP", "3000"))              # cap stored IDs
+SEEN_CAP = int(os.getenv("SEEN_CAP", "50000"))              # cap stored IDs
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))  # seconds
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0"))  # USD, e.g. 50000
 
