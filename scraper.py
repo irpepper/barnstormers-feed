@@ -21,15 +21,24 @@ MIN_PRICE = float(os.getenv("MIN_PRICE", "0"))  # USD, e.g. 50000
 URLS_FILE = os.getenv("URLS_FILE", "urls.txt")
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
 
-# Title substrings (case-insensitive) that mark an ad as a recurring service
-# listing rather than an actual aircraft/part for sale, so it's dropped before
-# ever reaching "new" or the digest. Extend via BLACKLIST_KEYWORDS env var
-# (comma-separated) without touching code.
+# Title substrings that mark an ad as a recurring service listing rather than
+# an actual aircraft/part for sale, so it's dropped before ever reaching "new"
+# or the digest. Matching is done on a punctuation-stripped, lowercased form
+# of the title (so "FAA A/C TRUST" and "FAA AC TRUST" are equivalent) since
+# these listings vary their punctuation ("A/C" vs "AC") between reposts.
+# Extend via BLACKLIST_KEYWORDS env var (comma-separated) without touching code.
 DEFAULT_BLACKLIST_TITLE_KEYWORDS = [
-    "faa ac trust",  # e.g. "FAA AC TRUST and N REGISTRATION" spam/service ad
+    "faa ac trust",  # e.g. "FAA AC TRUST and N REGISTRATION" / "FAA A/C TRUST..."
+    "aircraft trust",
 ]
+
+
+def _normalize(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
 BLACKLIST_TITLE_KEYWORDS = [
-    kw.strip().lower()
+    _normalize(kw)
     for kw in (
         DEFAULT_BLACKLIST_TITLE_KEYWORDS
         + os.getenv("BLACKLIST_KEYWORDS", "").split(",")
@@ -39,7 +48,7 @@ BLACKLIST_TITLE_KEYWORDS = [
 
 
 def is_blacklisted(title: str) -> bool:
-    blob = (title or "").lower()
+    blob = _normalize(title)
     return any(kw in blob for kw in BLACKLIST_TITLE_KEYWORDS)
 
 
