@@ -20,7 +20,7 @@ MAX_EMAIL_ITEMS = int(os.getenv("MAX_EMAIL_ITEMS", "50"))   # cap email size
 SEEN_CAP = int(os.getenv("SEEN_CAP", "50000"))              # cap stored IDs
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))  # seconds
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0"))  # USD, e.g. 50000
-MAX_PAGES = int(os.getenv("MAX_PAGES", "20"))  # listing pages per category URL
+MAX_PAGES = int(os.getenv("MAX_PAGES", "200"))  # safety cap on listing pages per URL
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.5"))  # seconds between fetches
 # One-off backfill (manual workflow run): email every matching ad posted in the
 # last N days, even ones already in seen.json. Unset/0 for normal runs.
@@ -41,6 +41,11 @@ SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
 DEFAULT_BLACKLIST_TITLE_KEYWORDS = [
     "faa ac trust",  # e.g. "FAA AC TRUST and N REGISTRATION" / "FAA A/C TRUST..."
     "aircraft trust",
+    # Repair-service ads ("APOLLO SL-40 COM REPAIR", "SL-50 GPS REPAIR"), not
+    # units for sale. Kept narrow so "SL40, needs repair" still gets through.
+    "com repair",
+    "gps repair",
+    "repair service",
 ]
 
 
@@ -513,53 +518,13 @@ def enrich_from_classified_page(ad: AdDetail) -> AdDetail:
 
 # ---------- Crawling ----------
 
-SUBCATEGORIES_PREFIX = "subcategories:"
-
-
-def expand_subcategories(urls: List[str]) -> List[str]:
+def scrape_category(url: str, seen: Set[str]) -> Dict[str, AdDetail]:
     """
-    A urls.txt line "subcategories: <parent category URL>" expands to the
-    parent plus every child category linked from it, e.g.
-    category-16581-Avionics.html -> category-16644-Avionics--Garmin.html,
-    category-16694-Avionics--Radio.html, ... so new subcategories are
-    picked up without editing urls.txt. Result is de-duplicated, in order.
-    """
-    out: List[str] = []
-    for line in urls:
-        if not line.lower().startswith(SUBCATEGORIES_PREFIX):
-            out.append(line)
-            continue
-        parent = line[len(SUBCATEGORIES_PREFIX):].strip()
-        out.append(parent)
-        m = re.search(r"/category-\d+-([^/?#]+?)\.html", parent)
-        if not m:
-            print(f"WARN: Can't find category slug in {parent}", file=sys.stderr)
-            continue
-        child_re = re.compile(r"/category-\d+-" + re.escape(m.group(1)) + r"--[^/?#]+\.html")
-        try:
-            html = fetch(parent)
-        except Exception as e:
-            print(f"WARN: Failed to fetch {parent}: {e}", file=sys.stderr)
-            continue
-        children = []
-        for a in BeautifulSoup(html, "lxml").find_all("a", href=True):
-            cm = child_re.search(a["href"])
-            if cm:
-                children.append(BASE + cm.group(0))
-        children = list(dict.fromkeys(children))
-        print(f"Discovered {len(children)} subcategories under {parent}")
-        if DRY_RUN:
-            for c in children:
-                print(f"  {c}")
-        out.extend(children)
-    return list(dict.fromkeys(out))
-
-
-def scrape_category(url: str) -> Dict[str, AdDetail]:
-    """
-    Fetch every page of one category listing. Follows the site's own
-    pagination link pattern; stops at MAX_PAGES or the first page that adds
-    no new ad IDs (end of list, or the site serving the same page again).
+    Fetch pages of one category listing (newest first), following the site's
+    own pagination link pattern. Stops at MAX_PAGES, at the first page that
+    adds no new ad IDs (end of list), or - on normal runs - at the first page
+    whose ads are all already in seen.json, since everything after it is
+    older. Backfill runs walk to the end so every old ad gets marked seen.
     """
     ads: Dict[str, AdDetail] = {}
     template: Optional[str] = None
@@ -586,6 +551,8 @@ def scrape_category(url: str) -> Dict[str, AdDetail]:
             break
         ads.update(fresh)
         pages_with_ads += 1
+        if not BACKFILL_DAYS and all(aid in seen for aid in fresh):
+            break
     print(f"Fetched {url}: {len(ads)} ads over {pages_with_ads} page(s)")
     return ads
 
@@ -744,8 +711,8 @@ def main() -> int:
 
     all_ads: Dict[str, AdDetail] = {}
 
-    for url in expand_subcategories(urls):
-        for aid, ad in scrape_category(url).items():
+    for url in urls:
+        for aid, ad in scrape_category(url, seen).items():
             if is_blacklisted(ad.title):
                 print(f"Blacklisted: {ad.title} ({ad.url})")
                 continue

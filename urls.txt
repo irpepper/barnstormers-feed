@@ -1,6 +1,5 @@
-# Category pages to scrape. Every ad is filtered by WATCH_PATTERNS in
-# scraper.py, so broad categories only cost fetches, not email noise.
-#
-# "subcategories:" scrapes the parent plus every child category it links to
-# (Avionics / Garmin, Avionics / Trig, Avionics / Radio, ...), each paginated.
-subcategories: https://www.barnstormers.com/category-16581-Avionics.html
+# Category pages to scrape (newest first; every page is followed). Every ad
+# is filtered by WATCH_PATTERNS in scraper.py, so a broad category only
+# costs fetches, not email noise. The Avionics parent lists all avionics ads
+# across its subcategories (Garmin, Trig, Radio, ...).
+https://www.barnstormers.com/category-16581-Avionics.html

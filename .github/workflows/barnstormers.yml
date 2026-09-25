@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       backfill_days:
-        description: "Email every matching ad posted in the last N days, even if already seen (blank = normal run)"
+        description: "Email every matching ad posted in the last N days, even if already seen; crawls every page (blank = normal run)"
         required: false
         default: ""
       dry_run:
