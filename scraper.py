@@ -3,6 +3,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -19,6 +20,9 @@ SEEN_CAP = int(os.getenv("SEEN_CAP", "50000"))              # cap stored IDs
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))  # seconds
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0"))  # USD, e.g. 50000
 MAX_PAGES = int(os.getenv("MAX_PAGES", "20"))  # listing pages per category URL
+# One-off backfill (manual workflow run): email every matching ad posted in the
+# last N days, even ones already in seen.json. Unset/0 for normal runs.
+BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS") or "0")
 
 URLS_FILE = os.getenv("URLS_FILE", "urls.txt")
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
@@ -207,6 +211,16 @@ def normalize_money(val: str) -> str:
     if not s.startswith("$"):
         s = "$" + s
     return s
+
+def parse_posted_date(posted: Optional[str]) -> Optional[date]:
+    """Convert "September 3, 2026" (or "Sep 3, 2026") -> date; None if unparseable."""
+    for fmt in ("%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime((posted or "").strip(), fmt).date()
+        except ValueError:
+            pass
+    return None
+
 
 def parse_price_value(price: Optional[str]) -> Optional[float]:
     """
@@ -656,7 +670,13 @@ def main() -> int:
             print(f"Fetched {page_url}: {len(fresh)} ads")
         print(f"{url}: {len(url_ids)} ads total")
 
-    new_ads = [ad for ad_id, ad in all_ads.items() if ad_id not in seen]
+    if BACKFILL_DAYS > 0:
+        # Reconsider everything; the posted-date cutoff is applied after
+        # enrichment, once every ad has had a chance to report its date.
+        print(f"Backfill mode: including already-seen ads posted in the last {BACKFILL_DAYS} days.")
+        new_ads = list(all_ads.values())
+    else:
+        new_ads = [ad for ad_id, ad in all_ads.items() if ad_id not in seen]
 
     if not new_ads:
         print("No new ads.")
@@ -699,6 +719,17 @@ def main() -> int:
 
     # The ad's own page may show it's sold even when the listing page didn't
     details = [ad for ad in details if not is_sold(ad)]
+
+    if BACKFILL_DAYS > 0:
+        cutoff = date.today() - timedelta(days=BACKFILL_DAYS)
+        kept: List[AdDetail] = []
+        for ad in details:
+            posted = parse_posted_date(ad.posted)
+            if posted is None or posted < cutoff:
+                print(f"Backfill: skipping {ad.title} (posted {ad.posted or 'unknown'})")
+                continue
+            kept.append(ad)
+        details = kept
 
     # If everything got filtered out, don't email; still mark as seen so you don't keep reprocessing
     if not details:

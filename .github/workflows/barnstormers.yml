@@ -3,7 +3,12 @@ name: Barnstormers Avionics Digest (Gmail SMTP)
 on:
   schedule:
     - cron: "*/30 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      backfill_days:
+        description: "Email every matching ad posted in the last N days, even if already seen (blank = normal run)"
+        required: false
+        default: ""
 
 permissions:
   contents: write  # allow committing updated seen.json
@@ -36,6 +41,7 @@ jobs:
           SEEN_CAP: "50000"
           REQUEST_TIMEOUT: "30"
           MIN_PRICE: "0"
+          BACKFILL_DAYS: ${{ inputs.backfill_days }}
 
         run: |
           python scraper.py
