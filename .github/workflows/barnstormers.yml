@@ -1,4 +1,4 @@
-name: Barnstormers Digest (Gmail SMTP)
+name: Barnstormers Avionics Digest (Gmail SMTP)
 
 on:
   schedule:
@@ -35,7 +35,7 @@ jobs:
           MAX_EMAIL_ITEMS: "200"
           SEEN_CAP: "50000"
           REQUEST_TIMEOUT: "30"
-          MIN_PRICE: "25000"
+          MIN_PRICE: "0"
 
         run: |
           python scraper.py

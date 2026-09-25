@@ -52,6 +52,32 @@ def is_blacklisted(title: str) -> bool:
     return any(kw in blob for kw in BLACKLIST_TITLE_KEYWORDS)
 
 
+# Only ads mentioning one of these radios (in title or description) are
+# emailed. Each entry is (label, regex); the regex runs on the lowercased
+# text and tolerates spacing/hyphen variants ("GTR 200", "GTR-200B",
+# "SL-40", "TY 96A"). Extend via WATCH_PATTERNS env var: comma-separated
+# regexes, each used as its own label.
+DEFAULT_WATCH_PATTERNS = [
+    ("Garmin GTR 200", r"\bgtr[\s-]*200[a-z]?\b"),
+    ("Garmin GTR 205", r"\bgtr[\s-]*205[a-z]?\b"),
+    ("Garmin SL40", r"\bsl[\s-]*40\b"),
+    ("Trig TY96", r"\bty[\s-]*96a?\b"),
+]
+
+WATCH_PATTERNS = [
+    (label, re.compile(rx, re.IGNORECASE))
+    for label, rx in (
+        DEFAULT_WATCH_PATTERNS
+        + [(rx.strip(), rx.strip()) for rx in os.getenv("WATCH_PATTERNS", "").split(",") if rx.strip()]
+    )
+]
+
+
+def watch_matches(title: str, desc: Optional[str]) -> List[str]:
+    blob = f"{title or ''} {desc or ''}"
+    return [label for label, rx in WATCH_PATTERNS if rx.search(blob)]
+
+
 # ---------- Models ----------
 
 @dataclass(frozen=True)
@@ -266,17 +292,16 @@ def parse_classified_single(div) -> Optional[AdDetail]:
         images=tuple(images),
     )
 
-ENGINE_RE = re.compile(r"\b(O|IO)-\s?(320|360|340|375|390)\b", re.IGNORECASE)
-IFR_RE = re.compile(r"\bIFR\b", re.IGNORECASE)
-AP_RE = re.compile(r"\bautopilot\b|\bAP\b", re.IGNORECASE)
-FP_RE = re.compile(r"\bfixed pitch\b|\bground adjustable\b|\bsensenich\b", re.IGNORECASE)
-CS_RE = re.compile(r"\bconstant speed\b|\bCS prop\b|\bhartzell\b|\bgovernor\b", re.IGNORECASE)
+YELLOW_TAG_RE = re.compile(r"\byellow[\s-]*tag\b|\b8130\b|\boverhaul(ed)?\b", re.IGNORECASE)
+TRAY_RE = re.compile(r"\btray\b|\brack\b|\bconnector", re.IGNORECASE)
+HARNESS_RE = re.compile(r"\bharness\b|\bwiring\b", re.IGNORECASE)
+WORKING_RE = re.compile(r"\bworking\b|\bremoved from\b|\bpulled from\b|\bnew in box\b|\bnib\b", re.IGNORECASE)
 
 def listing_quality_score(ad: AdDetail) -> int:
     """
     Higher is better. Tuned for your goals:
     - photos + price + real description + location = most important
-    - attribute extraction (engine, IFR, AP, prop) = bonus
+    - avionics details (yellow tag, tray, harness, known working) = bonus
     """
     score = 0
 
@@ -309,18 +334,14 @@ def listing_quality_score(ad: AdDetail) -> int:
     # Attribute bonuses (from title+desc)
     blob = f"{ad.title} {desc}"
 
-    if ENGINE_RE.search(blob):
+    if YELLOW_TAG_RE.search(blob):
         score += 10
-    if IFR_RE.search(blob):
+    if TRAY_RE.search(blob):
         score += 5
-    if AP_RE.search(blob):
+    if HARNESS_RE.search(blob):
+        score += 3
+    if WORKING_RE.search(blob):
         score += 5
-
-    # Prop type bonus (either direction is useful info)
-    if FP_RE.search(blob):
-        score += 3
-    if CS_RE.search(blob):
-        score += 3
 
     # Posted date present is mildly useful
     if ad.posted:
@@ -412,7 +433,7 @@ def trim_seen_ids(seen_ids: Set[str], cap: int) -> List[str]:
 
 def build_digest_text(new_ads: List[AdDetail]) -> str:
     lines: List[str] = []
-    lines.append(f"New Barnstormers listings: {len(new_ads)}")
+    lines.append(f"New Barnstormers avionics matches: {len(new_ads)}")
     lines.append("")
     for ad in new_ads[:MAX_EMAIL_ITEMS]:
         price = ad.price or "Price N/A"
@@ -434,25 +455,15 @@ def truncate(s: str, n: int) -> str:
 
 
 def chips_from_text(title: str, desc: Optional[str]) -> List[str]:
-    blob = (title + " " + (desc or "")).lower()
-    chips: List[str] = []
+    chips: List[str] = [f"📻 {m}" for m in watch_matches(title, desc)]
+    blob = f"{title} {desc or ''}"
 
-    if any(x in blob for x in ["ifr", "ifd", "gns", "waas", "430w", "navigator"]):
-        chips.append("🧭 IFR")
-    if "autopilot" in blob:
-        chips.append("🤖 AP")
-    if any(x in blob for x in ["rv-6a", "rv6a", "rv-7a", "rv7a", "rv-9a", "rv9a", "tricycle", "nose gear"]):
-        chips.append("🛞 Nose")
-    if "tailwheel" in blob or "tail wheel" in blob:
-        chips.append("🛞 Tail")
-    if any(x in blob for x in ["constant speed", "cs prop", "hartzell", "governor"]):
-        chips.append("⚙️ CS")
-    if any(x in blob for x in ["fixed pitch", "ground adjustable prop", "sensenich", "whirlwind ground adjustable"]):
-        chips.append("⚙️ FP")
-    if "o-320" in blob:
-        chips.append("🧰 O-320")
-    if "o-360" in blob:
-        chips.append("🧰 O-360")
+    if YELLOW_TAG_RE.search(blob):
+        chips.append("🏷️ Yellow tag")
+    if TRAY_RE.search(blob):
+        chips.append("🔌 Tray")
+    if HARNESS_RE.search(blob):
+        chips.append("🧵 Harness")
 
     return chips[:6]
 
@@ -531,9 +542,9 @@ def build_digest_html(details: List[AdDetail]) -> str:
 
     header = f"""
     <div style="max-width:680px;margin:0 auto;padding:14px 10px;font-family:Arial,sans-serif;">
-      <div style="font-size:20px;font-weight:900;color:#111;">Barnstormers: {len(details)} new listings</div>
+      <div style="font-size:20px;font-weight:900;color:#111;">Barnstormers avionics: {len(details)} new matches</div>
       <div style="font-size:12px;color:#666;margin-top:4px;">
-        Filters: minimum price ${int(MIN_PRICE):,}
+        Watching: {html_escape(", ".join(label for label, _ in WATCH_PATTERNS))}
       </div>
     </div>
     """
@@ -578,13 +589,19 @@ def main() -> int:
         except Exception as e:
             print(f"WARN: Failed to process {url}: {e}", file=sys.stderr)
 
-        new_ads = [ad for ad_id, ad in all_ads.items() if ad_id not in seen]
+    new_ads = [ad for ad_id, ad in all_ads.items() if ad_id not in seen]
 
     if not new_ads:
         print("No new ads.")
         return 0
 
     new_ads = sort_newest_first(new_ads)
+
+    # Keep only ads for the radios we're watching. Non-matching ads are still
+    # marked seen below so they're never re-checked.
+    all_new_ids = [ad.ad_id for ad in new_ads]
+    new_ads = [ad for ad in new_ads if watch_matches(ad.title, ad.description)]
+    print(f"{len(new_ads)} of {len(all_new_ids)} new ads match the watch list.")
 
     # Enrich missing details from each ad's own page (best-effort)
     details: List[AdDetail] = []
@@ -613,7 +630,7 @@ def main() -> int:
     # If everything got filtered out, don't email; still mark as seen so you don't keep reprocessing
     if not details:
         print(f"No new ads after filtering (MIN_PRICE={MIN_PRICE}).")
-        seen.update(ad.ad_id for ad in new_ads)
+        seen.update(all_new_ids)
         trimmed = trim_seen_ids(seen, SEEN_CAP)
         save_seen(SEEN_FILE, trimmed)
         print(f"Updated {SEEN_FILE} (kept {len(trimmed)} ids).")
@@ -627,14 +644,14 @@ def main() -> int:
     html_body = build_digest_html(details)
 
     send_email_gmail_smtp(
-        subject=f"Barnstormers: {len(details)} new listings",
+        subject=f"Barnstormers avionics: {len(details)} new matches",
         body_text=text_body,
         body_html=html_body,
     )
     print("Email sent via Gmail SMTP.")
 
-    # Update seen IDs (mark ALL new_ads as seen, even if filtered out, to prevent repeat noise)
-    seen.update(ad.ad_id for ad in new_ads)
+    # Update seen IDs (mark ALL new ads as seen, even if filtered out, to prevent repeat noise)
+    seen.update(all_new_ids)
     trimmed = trim_seen_ids(seen, SEEN_CAP)
     save_seen(SEEN_FILE, trimmed)
     print(f"Updated {SEEN_FILE} (kept {len(trimmed)} ids).")
