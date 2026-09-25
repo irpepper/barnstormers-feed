@@ -2,10 +2,11 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Set, Tuple
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,6 +21,7 @@ SEEN_CAP = int(os.getenv("SEEN_CAP", "50000"))              # cap stored IDs
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))  # seconds
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0"))  # USD, e.g. 50000
 MAX_PAGES = int(os.getenv("MAX_PAGES", "20"))  # listing pages per category URL
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.5"))  # seconds between fetches
 # One-off backfill (manual workflow run): email every matching ad posted in the
 # last N days, even ones already in seen.json. Unset/0 for normal runs.
 BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS") or "0")
@@ -174,14 +176,20 @@ def fetch(url: str) -> str:
     return r.text
 
 
-def with_page(url: str, page: int) -> str:
-    """Return url with its ?page= query param set (page 1 = url unchanged)."""
-    if page <= 1:
-        return url
-    parts = urlsplit(url)
-    query = [(k, v) for k, v in parse_qsl(parts.query) if k != "page"]
-    query.append(("page", str(page)))
-    return urlunsplit(parts._replace(query=urlencode(query)))
+def page_url_template(html: str, base_url: str) -> Optional[str]:
+    """
+    Find the site's own "?...page=N" link on a listing page and return it as
+    an absolute URL with "{page}" in place of N, or None if the listing has
+    a single page. Category pages paginate as
+    /category-16644-Avionics--Garmin.html?seocategory=...&page=3, so we copy
+    the site's link rather than guessing the query string.
+    """
+    for a in BeautifulSoup(html, "lxml").find_all("a", href=True):
+        href = a["href"]
+        if re.search(r"[?&]page=\d+", href):
+            absolute = urljoin(base_url, href)
+            return re.sub(r"([?&]page=)\d+", r"\g<1>{page}", absolute, count=1)
+    return None
 
 
 def normalize_url(href: str) -> str:
@@ -503,6 +511,85 @@ def enrich_from_classified_page(ad: AdDetail) -> AdDetail:
     return ad
 
 
+# ---------- Crawling ----------
+
+SUBCATEGORIES_PREFIX = "subcategories:"
+
+
+def expand_subcategories(urls: List[str]) -> List[str]:
+    """
+    A urls.txt line "subcategories: <parent category URL>" expands to the
+    parent plus every child category linked from it, e.g.
+    category-16581-Avionics.html -> category-16644-Avionics--Garmin.html,
+    category-16694-Avionics--Radio.html, ... so new subcategories are
+    picked up without editing urls.txt. Result is de-duplicated, in order.
+    """
+    out: List[str] = []
+    for line in urls:
+        if not line.lower().startswith(SUBCATEGORIES_PREFIX):
+            out.append(line)
+            continue
+        parent = line[len(SUBCATEGORIES_PREFIX):].strip()
+        out.append(parent)
+        m = re.search(r"/category-\d+-([^/?#]+?)\.html", parent)
+        if not m:
+            print(f"WARN: Can't find category slug in {parent}", file=sys.stderr)
+            continue
+        child_re = re.compile(r"/category-\d+-" + re.escape(m.group(1)) + r"--[^/?#]+\.html")
+        try:
+            html = fetch(parent)
+        except Exception as e:
+            print(f"WARN: Failed to fetch {parent}: {e}", file=sys.stderr)
+            continue
+        children = []
+        for a in BeautifulSoup(html, "lxml").find_all("a", href=True):
+            cm = child_re.search(a["href"])
+            if cm:
+                children.append(BASE + cm.group(0))
+        children = list(dict.fromkeys(children))
+        print(f"Discovered {len(children)} subcategories under {parent}")
+        if DRY_RUN:
+            for c in children:
+                print(f"  {c}")
+        out.extend(children)
+    return list(dict.fromkeys(out))
+
+
+def scrape_category(url: str) -> Dict[str, AdDetail]:
+    """
+    Fetch every page of one category listing. Follows the site's own
+    pagination link pattern; stops at MAX_PAGES or the first page that adds
+    no new ad IDs (end of list, or the site serving the same page again).
+    """
+    ads: Dict[str, AdDetail] = {}
+    template: Optional[str] = None
+    pages_with_ads = 0
+    for page in range(1, MAX_PAGES + 1):
+        if page == 1:
+            page_url = url
+        elif template:
+            page_url = template.format(page=page)
+        else:
+            break  # no pagination links: single-page category
+        time.sleep(REQUEST_DELAY)  # be polite: this runs every 30 minutes
+        try:
+            html = fetch(page_url)
+        except Exception as e:
+            print(f"WARN: Failed to fetch {page_url}: {e}", file=sys.stderr)
+            break
+        if page == 1:
+            template = page_url_template(html, url)
+        fresh = {aid: ad for aid, ad in extract_ads_from_listing_page(html).items() if aid not in ads}
+        if not fresh:
+            if page == 1:
+                print(f"WARN: No ads parsed from {page_url} ({len(html)} bytes)", file=sys.stderr)
+            break
+        ads.update(fresh)
+        pages_with_ads += 1
+    print(f"Fetched {url}: {len(ads)} ads over {pages_with_ads} page(s)")
+    return ads
+
+
 # ---------- Digest builders ----------
 
 def sort_newest_first(ads: List[AdDetail]) -> List[AdDetail]:
@@ -657,49 +744,13 @@ def main() -> int:
 
     all_ads: Dict[str, AdDetail] = {}
 
-    for url in urls:
-        # Walk ?page=1..MAX_PAGES. Stop at the first page that adds no ad IDs
-        # we haven't already seen for this URL: that's the end of the list, or
-        # the site ignoring ?page= and serving page 1 again.
-        url_ids: Set[str] = set()
-        for page in range(1, MAX_PAGES + 1):
-            page_url = with_page(url, page)
-            try:
-                html = fetch(page_url)
-            except Exception as e:
-                print(f"WARN: Failed to fetch {page_url}: {e}", file=sys.stderr)
-                break
-            ads = extract_ads_from_listing_page(html)
-            if page == 1:
-                # Log the site's own pagination links so a change in its
-                # ?page= scheme shows up in the Actions log.
-                page_links = sorted({
-                    a["href"] for a in BeautifulSoup(html, "lxml").find_all("a", href=True)
-                    if re.search(r"[?&]page=\d", a["href"])
-                })
-                print(f"Pagination links on {page_url}: {page_links[:5] or 'none'}")
-                if DRY_RUN:
-                    cat_links = sorted({
-                        (a["href"], a.get_text(" ", strip=True)[:40])
-                        for a in BeautifulSoup(html, "lxml").find_all("a", href=True)
-                        if re.search(r"catid=\d|category-\d|Classifieds\.htm|main=", a["href"])
-                    })
-                    print(f"Category links on {page_url} ({len(cat_links)}):")
-                    for href, text in cat_links[:80]:
-                        print(f"  {href}  [{text}]")
-            fresh = {aid: ad for aid, ad in ads.items() if aid not in url_ids}
-            if not fresh:
-                if page == 1:
-                    print(f"WARN: No ads parsed from {page_url} ({len(html)} bytes)", file=sys.stderr)
-                break
-            url_ids.update(fresh)
-            blacklisted = {aid: ad for aid, ad in fresh.items() if is_blacklisted(ad.title)}
-            for ad in blacklisted.values():
+    for url in expand_subcategories(urls):
+        for aid, ad in scrape_category(url).items():
+            if is_blacklisted(ad.title):
                 print(f"Blacklisted: {ad.title} ({ad.url})")
-            fresh = {aid: ad for aid, ad in fresh.items() if aid not in blacklisted}
-            all_ads.update(fresh)  # cross-category dedupe by ad_id
-            print(f"Fetched {page_url}: {len(fresh)} ads")
-        print(f"{url}: {len(url_ids)} ads total")
+                continue
+            all_ads[aid] = ad  # cross-category dedupe by ad_id
+    print(f"{len(all_ads)} unique ads across all categories.")
 
     if BACKFILL_DAYS > 0:
         # Reconsider everything; the posted-date cutoff is applied after
