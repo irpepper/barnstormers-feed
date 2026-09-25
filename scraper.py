@@ -4,6 +4,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -17,6 +18,7 @@ MAX_EMAIL_ITEMS = int(os.getenv("MAX_EMAIL_ITEMS", "50"))   # cap email size
 SEEN_CAP = int(os.getenv("SEEN_CAP", "50000"))              # cap stored IDs
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))  # seconds
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0"))  # USD, e.g. 50000
+MAX_PAGES = int(os.getenv("MAX_PAGES", "20"))  # listing pages per category URL
 
 URLS_FILE = os.getenv("URLS_FILE", "urls.txt")
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
@@ -78,6 +80,27 @@ def watch_matches(title: str, desc: Optional[str]) -> List[str]:
     return [label for label, rx in WATCH_PATTERNS if rx.search(blob)]
 
 
+# Sellers mark sold ads by editing the title ("SOLD - Garmin SL40") or the
+# body ("SOLD!", "radio has been sold") rather than removing them. Phrases like
+# "sold as is" / "sold with tray" describe the sale, not its status, so they're
+# excluded. In the description only shouted "SOLD" or explicit "has been sold"
+# style phrases count, to avoid tripping on ordinary sentences.
+_NOT_STATUS = r"(?!\s+(?:as|with|separately|together|individually|by|new|in|for|only|out|to)\b)"
+SOLD_TITLE_RE = re.compile(r"\bsold\b" + _NOT_STATUS, re.IGNORECASE)
+SOLD_DESC_SHOUT_RE = re.compile(r"\bSOLD\b" + _NOT_STATUS)
+SOLD_DESC_PHRASE_RE = re.compile(
+    r"^\W*sold\b" + _NOT_STATUS + r"|\b(?:has|have|had) been sold\b|\b(?:is|now|already) sold\b" + _NOT_STATUS,
+    re.IGNORECASE,
+)
+
+
+def is_sold(ad: "AdDetail") -> bool:
+    if ad.sold_marker or SOLD_TITLE_RE.search(ad.title or ""):
+        return True
+    desc = ad.description or ""
+    return bool(SOLD_DESC_SHOUT_RE.search(desc) or SOLD_DESC_PHRASE_RE.search(desc))
+
+
 # ---------- Models ----------
 
 @dataclass(frozen=True)
@@ -91,6 +114,7 @@ class AdDetail:
     posted: Optional[str] = None
     description: Optional[str] = None
     images: Tuple[str, ...] = field(default_factory=tuple)
+    sold_marker: bool = False  # site-level "sold" badge/class on the ad block
 
 
 # ---------- IO helpers ----------
@@ -131,6 +155,16 @@ def fetch(url: str) -> str:
     r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.text
+
+
+def with_page(url: str, page: int) -> str:
+    """Return url with its ?page= query param set (page 1 = url unchanged)."""
+    if page <= 1:
+        return url
+    parts = urlsplit(url)
+    query = [(k, v) for k, v in parse_qsl(parts.query) if k != "page"]
+    query.append(("page", str(page)))
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 def normalize_url(href: str) -> str:
@@ -281,6 +315,15 @@ def parse_classified_single(div) -> Optional[AdDetail]:
             images.append(u)
     images = images[:6]
 
+    # Sold badge: any class, image src or alt text in the block mentioning "sold"
+    sold_marker = any(
+        re.search(r"\bsold\b", " ".join(el.get("class") or []), re.IGNORECASE)
+        for el in div.find_all(class_=True)
+    ) or any(
+        re.search(r"(?<![a-z])sold(?![a-z])", f"{img.get('src') or ''} {img.get('alt') or ''}", re.IGNORECASE)
+        for img in div.find_all("img")
+    )
+
     return AdDetail(
         ad_id=ad_id,
         title=title,
@@ -290,6 +333,7 @@ def parse_classified_single(div) -> Optional[AdDetail]:
         posted=posted,
         description=description,
         images=tuple(images),
+        sold_marker=sold_marker,
     )
 
 YELLOW_TAG_RE = re.compile(r"\byellow[\s-]*tag\b|\b8130\b|\boverhaul(ed)?\b", re.IGNORECASE)
@@ -415,6 +459,7 @@ def enrich_from_classified_page(ad: AdDetail) -> AdDetail:
                 posted=parsed.posted or ad.posted,
                 description=parsed.description or ad.description,
                 images=parsed.images or ad.images,
+                sold_marker=parsed.sold_marker or ad.sold_marker,
             )
 
     # If we couldn't find the structured block, just return original.
@@ -577,17 +622,39 @@ def main() -> int:
     all_ads: Dict[str, AdDetail] = {}
 
     for url in urls:
-        try:
-            html = fetch(url)
+        # Walk ?page=1..MAX_PAGES. Stop at the first page that adds no ad IDs
+        # we haven't already seen for this URL: that's the end of the list, or
+        # the site ignoring ?page= and serving page 1 again.
+        url_ids: Set[str] = set()
+        for page in range(1, MAX_PAGES + 1):
+            page_url = with_page(url, page)
+            try:
+                html = fetch(page_url)
+            except Exception as e:
+                print(f"WARN: Failed to fetch {page_url}: {e}", file=sys.stderr)
+                break
             ads = extract_ads_from_listing_page(html)
-            blacklisted = {aid: ad for aid, ad in ads.items() if is_blacklisted(ad.title)}
+            if page == 1:
+                # Log the site's own pagination links so a change in its
+                # ?page= scheme shows up in the Actions log.
+                page_links = sorted({
+                    a["href"] for a in BeautifulSoup(html, "lxml").find_all("a", href=True)
+                    if re.search(r"[?&]page=\d", a["href"])
+                })
+                print(f"Pagination links on {page_url}: {page_links[:5] or 'none'}")
+            fresh = {aid: ad for aid, ad in ads.items() if aid not in url_ids}
+            if not fresh:
+                if page == 1:
+                    print(f"WARN: No ads parsed from {page_url} ({len(html)} bytes)", file=sys.stderr)
+                break
+            url_ids.update(fresh)
+            blacklisted = {aid: ad for aid, ad in fresh.items() if is_blacklisted(ad.title)}
             for ad in blacklisted.values():
                 print(f"Blacklisted: {ad.title} ({ad.url})")
-            ads = {aid: ad for aid, ad in ads.items() if aid not in blacklisted}
-            all_ads.update(ads)  # cross-category dedupe by ad_id
-            print(f"Fetched {url}: {len(ads)} ads")
-        except Exception as e:
-            print(f"WARN: Failed to process {url}: {e}", file=sys.stderr)
+            fresh = {aid: ad for aid, ad in fresh.items() if aid not in blacklisted}
+            all_ads.update(fresh)  # cross-category dedupe by ad_id
+            print(f"Fetched {page_url}: {len(fresh)} ads")
+        print(f"{url}: {len(url_ids)} ads total")
 
     new_ads = [ad for ad_id, ad in all_ads.items() if ad_id not in seen]
 
@@ -602,6 +669,9 @@ def main() -> int:
     all_new_ids = [ad.ad_id for ad in new_ads]
     new_ads = [ad for ad in new_ads if watch_matches(ad.title, ad.description)]
     print(f"{len(new_ads)} of {len(all_new_ids)} new ads match the watch list.")
+    for ad in [ad for ad in new_ads if is_sold(ad)]:
+        print(f"Skipping sold: {ad.title} ({ad.url})")
+    new_ads = [ad for ad in new_ads if not is_sold(ad)]
 
     # Enrich missing details from each ad's own page (best-effort)
     details: List[AdDetail] = []
@@ -626,6 +696,9 @@ def main() -> int:
             elif val >= MIN_PRICE:
                 filtered.append(ad)
         details = filtered
+
+    # The ad's own page may show it's sold even when the listing page didn't
+    details = [ad for ad in details if not is_sold(ad)]
 
     # If everything got filtered out, don't email; still mark as seen so you don't keep reprocessing
     if not details:
