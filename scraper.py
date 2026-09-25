@@ -2,8 +2,11 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -17,6 +20,14 @@ MAX_EMAIL_ITEMS = int(os.getenv("MAX_EMAIL_ITEMS", "50"))   # cap email size
 SEEN_CAP = int(os.getenv("SEEN_CAP", "50000"))              # cap stored IDs
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))  # seconds
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0"))  # USD, e.g. 50000
+MAX_PAGES = int(os.getenv("MAX_PAGES", "200"))  # safety cap on listing pages per URL
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.5"))  # seconds between fetches
+# One-off backfill (manual workflow run): email every matching ad posted in the
+# last N days, even ones already in seen.json. Unset/0 for normal runs.
+BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS") or "0")
+# Dry run: log what would be emailed (plus page structure) without sending
+# email or updating seen.json.
+DRY_RUN = (os.getenv("DRY_RUN") or "").strip().lower() in ("1", "true", "yes")
 
 URLS_FILE = os.getenv("URLS_FILE", "urls.txt")
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
@@ -30,6 +41,14 @@ SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
 DEFAULT_BLACKLIST_TITLE_KEYWORDS = [
     "faa ac trust",  # e.g. "FAA AC TRUST and N REGISTRATION" / "FAA A/C TRUST..."
     "aircraft trust",
+    # Repair-service ads ("APOLLO SL-40 COM REPAIR", "SL-50 GPS REPAIR"), not
+    # units for sale. Kept narrow so "SL40, needs repair" still gets through.
+    "com repair",
+    "gps repair",
+    "repair service",
+    # Buyer ads ("WANTED AVIONICS", "WTB SL40"), not units for sale
+    "wanted",
+    "wtb",
 ]
 
 
@@ -52,6 +71,62 @@ def is_blacklisted(title: str) -> bool:
     return any(kw in blob for kw in BLACKLIST_TITLE_KEYWORDS)
 
 
+# Only ads mentioning one of these radios (in title or description) are
+# emailed. Each entry is (label, regex); the regex runs on the lowercased
+# text and tolerates spacing/hyphen variants ("GTR 200", "GTR-200B",
+# "SL-40", "TY 96A"). Extend via WATCH_PATTERNS env var: comma-separated
+# regexes, each used as its own label.
+DEFAULT_WATCH_PATTERNS = [
+    ("Garmin GTR 200", r"\bgtr[\s-]*200[a-z]?\b"),
+    ("Garmin GTR 205", r"\bgtr[\s-]*205[a-z]?\b"),
+    ("Garmin SL40", r"\bsl[\s-]*40\b"),
+    ("Trig TY96", r"\bty[\s-]*96a?\b"),
+]
+
+WATCH_PATTERNS = [
+    (label, re.compile(rx, re.IGNORECASE))
+    for label, rx in (
+        DEFAULT_WATCH_PATTERNS
+        + [(rx.strip(), rx.strip()) for rx in os.getenv("WATCH_PATTERNS", "").split(",") if rx.strip()]
+    )
+]
+
+
+def watch_matches(title: str, desc: Optional[str]) -> List[str]:
+    blob = f"{title or ''} {desc or ''}"
+    return [label for label, rx in WATCH_PATTERNS if rx.search(blob)]
+
+
+# Sellers mark sold ads by editing the title ("SOLD - Garmin SL40") or the
+# body ("SOLD!", "radio has been sold") rather than removing them. Phrases like
+# "sold as is" / "sold with tray" describe the sale, not its status, so they're
+# excluded. In the description only shouted "SOLD" or explicit "has been sold"
+# style phrases count, to avoid tripping on ordinary sentences.
+_NOT_STATUS = r"(?!\s+(?:as|with|separately|together|individually|by|new|in|for|only|out|to)\b)"
+SOLD_TITLE_RE = re.compile(r"\bsold\b" + _NOT_STATUS, re.IGNORECASE)
+SOLD_DESC_SHOUT_RE = re.compile(r"\bSOLD\b" + _NOT_STATUS)
+SOLD_DESC_PHRASE_RE = re.compile(
+    r"^\W*sold\b" + _NOT_STATUS + r"|\b(?:has|have|had) been sold\b|\b(?:is|now|already) sold\b" + _NOT_STATUS,
+    re.IGNORECASE,
+)
+
+
+def is_sold(ad: "AdDetail") -> bool:
+    if ad.sold_marker or SOLD_TITLE_RE.search(ad.title or ""):
+        return True
+    # raw_text covers the whole ad block (price line, badges), not just the body
+    for text in (ad.description or "", ad.raw_text or ""):
+        if SOLD_DESC_SHOUT_RE.search(text) or SOLD_DESC_PHRASE_RE.search(text):
+            return True
+    return False
+
+
+def sold_context(ad: "AdDetail") -> List[str]:
+    """Snippets around any "sold" in the ad block, for diagnosing is_sold()."""
+    text = ad.raw_text or ad.description or ""
+    return [text[max(0, m.start() - 30): m.end() + 30] for m in re.finditer(r"sold", text, re.IGNORECASE)][:3]
+
+
 # ---------- Models ----------
 
 @dataclass(frozen=True)
@@ -65,6 +140,8 @@ class AdDetail:
     posted: Optional[str] = None
     description: Optional[str] = None
     images: Tuple[str, ...] = field(default_factory=tuple)
+    sold_marker: bool = False  # site-level "sold" badge/class on the ad block
+    raw_text: str = field(default="", repr=False)  # full text of the ad block
 
 
 # ---------- IO helpers ----------
@@ -107,6 +184,22 @@ def fetch(url: str) -> str:
     return r.text
 
 
+def page_url_template(html: str, base_url: str) -> Optional[str]:
+    """
+    Find the site's own "?...page=N" link on a listing page and return it as
+    an absolute URL with "{page}" in place of N, or None if the listing has
+    a single page. Category pages paginate as
+    /category-16644-Avionics--Garmin.html?seocategory=...&page=3, so we copy
+    the site's link rather than guessing the query string.
+    """
+    for a in BeautifulSoup(html, "lxml").find_all("a", href=True):
+        href = a["href"]
+        if re.search(r"[?&]page=\d+", href):
+            absolute = urljoin(base_url, href)
+            return re.sub(r"([?&]page=)\d+", r"\g<1>{page}", absolute, count=1)
+    return None
+
+
 def normalize_url(href: str) -> str:
     if href.startswith("http://") or href.startswith("https://"):
         return href
@@ -122,6 +215,10 @@ POSTED_RE = re.compile(r"\bPosted\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})\b")
 LOC_IN_BODY_RE = re.compile(r"\b([A-Za-z .'-]+,\s*[A-Z]{2})\b")  # "Bisbee, AZ"
 LOC_IN_CONTACT_RE = re.compile(r"\blocated\s+(.+?)\s+United States\b", re.IGNORECASE)
 DOLLAR_RE = re.compile(r"\$\s*[\d,]+(?:\.\d{2})?")
+
+# Stock "no photo" placeholders the site serves for ads without pictures
+NO_IMAGE_RE = re.compile(r"no[_-]?(?:image|photo|pic)|placeholder|blank\.(?:gif|png|jpe?g)|spacer", re.IGNORECASE)
+
 
 def thumbnail_to_large(url: str) -> str:
     """
@@ -147,6 +244,16 @@ def normalize_money(val: str) -> str:
     if not s.startswith("$"):
         s = "$" + s
     return s
+
+def parse_posted_date(posted: Optional[str]) -> Optional[date]:
+    """Convert "September 3, 2026" (or "Sep 3, 2026") -> date; None if unparseable."""
+    for fmt in ("%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime((posted or "").strip(), fmt).date()
+        except ValueError:
+            pass
+    return None
+
 
 def parse_price_value(price: Optional[str]) -> Optional[float]:
     """
@@ -242,7 +349,7 @@ def parse_classified_single(div) -> Optional[AdDetail]:
     imgs = []
     for img in div.select("img.thumbnail[src]"):
         src = (img.get("src") or "").strip()
-        if not src:
+        if not src or NO_IMAGE_RE.search(src):
             continue
         imgs.append(thumbnail_to_large(src))
 
@@ -255,6 +362,19 @@ def parse_classified_single(div) -> Optional[AdDetail]:
             images.append(u)
     images = images[:6]
 
+    # Sold badge: any class, image src or alt text in the block mentioning
+    # "sold" (letters-only boundaries so "classified_sold" / "sold-badge" count)
+    sold_word = re.compile(r"(?<![a-z])sold(?![a-z])", re.IGNORECASE)
+    sold_marker = any(
+        sold_word.search(" ".join(el.get("class") or []))
+        for el in [div] + div.find_all(class_=True)
+    ) or bool(
+        price_span and re.search(r"\bsold\b", price_span.get_text(" ", strip=True), re.IGNORECASE)
+    ) or any(
+        sold_word.search(f"{img.get('src') or ''} {img.get('alt') or ''}")
+        for img in div.find_all("img")
+    )
+
     return AdDetail(
         ad_id=ad_id,
         title=title,
@@ -264,19 +384,20 @@ def parse_classified_single(div) -> Optional[AdDetail]:
         posted=posted,
         description=description,
         images=tuple(images),
+        sold_marker=sold_marker,
+        raw_text=div_text,
     )
 
-ENGINE_RE = re.compile(r"\b(O|IO)-\s?(320|360|340|375|390)\b", re.IGNORECASE)
-IFR_RE = re.compile(r"\bIFR\b", re.IGNORECASE)
-AP_RE = re.compile(r"\bautopilot\b|\bAP\b", re.IGNORECASE)
-FP_RE = re.compile(r"\bfixed pitch\b|\bground adjustable\b|\bsensenich\b", re.IGNORECASE)
-CS_RE = re.compile(r"\bconstant speed\b|\bCS prop\b|\bhartzell\b|\bgovernor\b", re.IGNORECASE)
+YELLOW_TAG_RE = re.compile(r"\byellow[\s-]*tag\b|\b8130\b|\boverhaul(ed)?\b", re.IGNORECASE)
+TRAY_RE = re.compile(r"\btray\b|\brack\b|\bconnector", re.IGNORECASE)
+HARNESS_RE = re.compile(r"\bharness\b|\bwiring\b", re.IGNORECASE)
+WORKING_RE = re.compile(r"\bworking\b|\bremoved from\b|\bpulled from\b|\bnew in box\b|\bnib\b", re.IGNORECASE)
 
 def listing_quality_score(ad: AdDetail) -> int:
     """
     Higher is better. Tuned for your goals:
     - photos + price + real description + location = most important
-    - attribute extraction (engine, IFR, AP, prop) = bonus
+    - avionics details (yellow tag, tray, harness, known working) = bonus
     """
     score = 0
 
@@ -309,18 +430,14 @@ def listing_quality_score(ad: AdDetail) -> int:
     # Attribute bonuses (from title+desc)
     blob = f"{ad.title} {desc}"
 
-    if ENGINE_RE.search(blob):
+    if YELLOW_TAG_RE.search(blob):
         score += 10
-    if IFR_RE.search(blob):
+    if TRAY_RE.search(blob):
         score += 5
-    if AP_RE.search(blob):
+    if HARNESS_RE.search(blob):
+        score += 3
+    if WORKING_RE.search(blob):
         score += 5
-
-    # Prop type bonus (either direction is useful info)
-    if FP_RE.search(blob):
-        score += 3
-    if CS_RE.search(blob):
-        score += 3
 
     # Posted date present is mildly useful
     if ad.posted:
@@ -394,10 +511,53 @@ def enrich_from_classified_page(ad: AdDetail) -> AdDetail:
                 posted=parsed.posted or ad.posted,
                 description=parsed.description or ad.description,
                 images=parsed.images or ad.images,
+                sold_marker=parsed.sold_marker or ad.sold_marker,
+                raw_text=parsed.raw_text or ad.raw_text,
             )
 
     # If we couldn't find the structured block, just return original.
     return ad
+
+
+# ---------- Crawling ----------
+
+def scrape_category(url: str, seen: Set[str]) -> Dict[str, AdDetail]:
+    """
+    Fetch pages of one category listing (newest first), following the site's
+    own pagination link pattern. Stops at MAX_PAGES, at the first page that
+    adds no new ad IDs (end of list), or - on normal runs - at the first page
+    whose ads are all already in seen.json, since everything after it is
+    older. Backfill runs walk to the end so every old ad gets marked seen.
+    """
+    ads: Dict[str, AdDetail] = {}
+    template: Optional[str] = None
+    pages_with_ads = 0
+    for page in range(1, MAX_PAGES + 1):
+        if page == 1:
+            page_url = url
+        elif template:
+            page_url = template.format(page=page)
+        else:
+            break  # no pagination links: single-page category
+        time.sleep(REQUEST_DELAY)  # be polite: this runs every 30 minutes
+        try:
+            html = fetch(page_url)
+        except Exception as e:
+            print(f"WARN: Failed to fetch {page_url}: {e}", file=sys.stderr)
+            break
+        if page == 1:
+            template = page_url_template(html, url)
+        fresh = {aid: ad for aid, ad in extract_ads_from_listing_page(html).items() if aid not in ads}
+        if not fresh:
+            if page == 1:
+                print(f"WARN: No ads parsed from {page_url} ({len(html)} bytes)", file=sys.stderr)
+            break
+        ads.update(fresh)
+        pages_with_ads += 1
+        if not BACKFILL_DAYS and all(aid in seen for aid in fresh):
+            break
+    print(f"Fetched {url}: {len(ads)} ads over {pages_with_ads} page(s)")
+    return ads
 
 
 # ---------- Digest builders ----------
@@ -412,7 +572,7 @@ def trim_seen_ids(seen_ids: Set[str], cap: int) -> List[str]:
 
 def build_digest_text(new_ads: List[AdDetail]) -> str:
     lines: List[str] = []
-    lines.append(f"New Barnstormers listings: {len(new_ads)}")
+    lines.append(f"New Barnstormers avionics matches: {len(new_ads)}")
     lines.append("")
     for ad in new_ads[:MAX_EMAIL_ITEMS]:
         price = ad.price or "Price N/A"
@@ -434,25 +594,15 @@ def truncate(s: str, n: int) -> str:
 
 
 def chips_from_text(title: str, desc: Optional[str]) -> List[str]:
-    blob = (title + " " + (desc or "")).lower()
-    chips: List[str] = []
+    chips: List[str] = [f"📻 {m}" for m in watch_matches(title, desc)]
+    blob = f"{title} {desc or ''}"
 
-    if any(x in blob for x in ["ifr", "ifd", "gns", "waas", "430w", "navigator"]):
-        chips.append("🧭 IFR")
-    if "autopilot" in blob:
-        chips.append("🤖 AP")
-    if any(x in blob for x in ["rv-6a", "rv6a", "rv-7a", "rv7a", "rv-9a", "rv9a", "tricycle", "nose gear"]):
-        chips.append("🛞 Nose")
-    if "tailwheel" in blob or "tail wheel" in blob:
-        chips.append("🛞 Tail")
-    if any(x in blob for x in ["constant speed", "cs prop", "hartzell", "governor"]):
-        chips.append("⚙️ CS")
-    if any(x in blob for x in ["fixed pitch", "ground adjustable prop", "sensenich", "whirlwind ground adjustable"]):
-        chips.append("⚙️ FP")
-    if "o-320" in blob:
-        chips.append("🧰 O-320")
-    if "o-360" in blob:
-        chips.append("🧰 O-360")
+    if YELLOW_TAG_RE.search(blob):
+        chips.append("🏷️ Yellow tag")
+    if TRAY_RE.search(blob):
+        chips.append("🔌 Tray")
+    if HARNESS_RE.search(blob):
+        chips.append("🧵 Harness")
 
     return chips[:6]
 
@@ -475,9 +625,8 @@ def render_card(ad: AdDetail) -> str:
         </a>
         """
     else:
-        hero_html = """
-        <div style="width:100%;border-radius:12px;background:#eee;height:180px;"></div>
-        """
+        # No photo: leave the image area out entirely rather than a blank box
+        hero_html = ""
 
     meta = []
     if loc:
@@ -531,9 +680,9 @@ def build_digest_html(details: List[AdDetail]) -> str:
 
     header = f"""
     <div style="max-width:680px;margin:0 auto;padding:14px 10px;font-family:Arial,sans-serif;">
-      <div style="font-size:20px;font-weight:900;color:#111;">Barnstormers: {len(details)} new listings</div>
+      <div style="font-size:20px;font-weight:900;color:#111;">Barnstormers avionics: {len(details)} new matches</div>
       <div style="font-size:12px;color:#666;margin-top:4px;">
-        Filters: minimum price ${int(MIN_PRICE):,}
+        Watching: {html_escape(", ".join(label for label, _ in WATCH_PATTERNS))}
       </div>
     </div>
     """
@@ -566,18 +715,19 @@ def main() -> int:
     all_ads: Dict[str, AdDetail] = {}
 
     for url in urls:
-        try:
-            html = fetch(url)
-            ads = extract_ads_from_listing_page(html)
-            blacklisted = {aid: ad for aid, ad in ads.items() if is_blacklisted(ad.title)}
-            for ad in blacklisted.values():
+        for aid, ad in scrape_category(url, seen).items():
+            if is_blacklisted(ad.title):
                 print(f"Blacklisted: {ad.title} ({ad.url})")
-            ads = {aid: ad for aid, ad in ads.items() if aid not in blacklisted}
-            all_ads.update(ads)  # cross-category dedupe by ad_id
-            print(f"Fetched {url}: {len(ads)} ads")
-        except Exception as e:
-            print(f"WARN: Failed to process {url}: {e}", file=sys.stderr)
+                continue
+            all_ads[aid] = ad  # cross-category dedupe by ad_id
+    print(f"{len(all_ads)} unique ads across all categories.")
 
+    if BACKFILL_DAYS > 0:
+        # Reconsider everything; the posted-date cutoff is applied after
+        # enrichment, once every ad has had a chance to report its date.
+        print(f"Backfill mode: including already-seen ads posted in the last {BACKFILL_DAYS} days.")
+        new_ads = list(all_ads.values())
+    else:
         new_ads = [ad for ad_id, ad in all_ads.items() if ad_id not in seen]
 
     if not new_ads:
@@ -585,6 +735,21 @@ def main() -> int:
         return 0
 
     new_ads = sort_newest_first(new_ads)
+
+    # Keep only ads for the radios we're watching. Non-matching ads are still
+    # marked seen below so they're never re-checked.
+    all_new_ids = [ad.ad_id for ad in new_ads]
+    new_ads = [ad for ad in new_ads if watch_matches(ad.title, ad.description)]
+    print(f"{len(new_ads)} of {len(all_new_ids)} new ads match the watch list.")
+    if DRY_RUN:
+        for ad in new_ads:
+            print(f"Match: {ad.title} | {ad.price} | posted {ad.posted} | sold={is_sold(ad)} | {ad.url}")
+            print(f"    images: {list(ad.images) or 'none'}")
+            for snip in sold_context(ad):
+                print(f"    sold context: ...{snip}...")
+    for ad in [ad for ad in new_ads if is_sold(ad)]:
+        print(f"Skipping sold: {ad.title} ({ad.url})")
+    new_ads = [ad for ad in new_ads if not is_sold(ad)]
 
     # Enrich missing details from each ad's own page (best-effort)
     details: List[AdDetail] = []
@@ -610,10 +775,30 @@ def main() -> int:
                 filtered.append(ad)
         details = filtered
 
+    # The ad's own page may show it's sold even when the listing page didn't
+    details = [ad for ad in details if not is_sold(ad)]
+
+    if BACKFILL_DAYS > 0:
+        cutoff = date.today() - timedelta(days=BACKFILL_DAYS)
+        kept: List[AdDetail] = []
+        for ad in details:
+            posted = parse_posted_date(ad.posted)
+            if posted is None or posted < cutoff:
+                print(f"Backfill: skipping {ad.title} (posted {ad.posted or 'unknown'})")
+                continue
+            kept.append(ad)
+        details = kept
+
     # If everything got filtered out, don't email; still mark as seen so you don't keep reprocessing
+    if DRY_RUN:
+        print(f"Dry run: would email {len(details)} ads; not sending or updating {SEEN_FILE}.")
+        for ad in details:
+            print(f"  would email: {ad.title} | {ad.price} | posted {ad.posted} | {ad.url}")
+        return 0
+
     if not details:
         print(f"No new ads after filtering (MIN_PRICE={MIN_PRICE}).")
-        seen.update(ad.ad_id for ad in new_ads)
+        seen.update(all_new_ids)
         trimmed = trim_seen_ids(seen, SEEN_CAP)
         save_seen(SEEN_FILE, trimmed)
         print(f"Updated {SEEN_FILE} (kept {len(trimmed)} ids).")
@@ -623,18 +808,18 @@ def main() -> int:
     details = sort_best_first(details)
 
     # Text fallback can still be newest-first or also quality-sorted; your call.
-    text_body = build_digest_text(new_ads)
+    text_body = build_digest_text(details)
     html_body = build_digest_html(details)
 
     send_email_gmail_smtp(
-        subject=f"Barnstormers: {len(details)} new listings",
+        subject=f"Barnstormers avionics: {len(details)} new matches",
         body_text=text_body,
         body_html=html_body,
     )
     print("Email sent via Gmail SMTP.")
 
-    # Update seen IDs (mark ALL new_ads as seen, even if filtered out, to prevent repeat noise)
-    seen.update(ad.ad_id for ad in new_ads)
+    # Update seen IDs (mark ALL new ads as seen, even if filtered out, to prevent repeat noise)
+    seen.update(all_new_ids)
     trimmed = trim_seen_ids(seen, SEEN_CAP)
     save_seen(SEEN_FILE, trimmed)
     print(f"Updated {SEEN_FILE} (kept {len(trimmed)} ids).")
