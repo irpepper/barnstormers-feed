@@ -9,6 +9,10 @@ on:
         description: "Email every matching ad posted in the last N days, even if already seen (blank = normal run)"
         required: false
         default: ""
+      dry_run:
+        description: "Log what would be emailed without sending or updating seen.json"
+        type: boolean
+        default: false
 
 permissions:
   contents: write  # allow committing updated seen.json
@@ -42,6 +46,7 @@ jobs:
           REQUEST_TIMEOUT: "30"
           MIN_PRICE: "0"
           BACKFILL_DAYS: ${{ inputs.backfill_days }}
+          DRY_RUN: ${{ inputs.dry_run }}
 
         run: |
           python scraper.py

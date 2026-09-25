@@ -23,6 +23,9 @@ MAX_PAGES = int(os.getenv("MAX_PAGES", "20"))  # listing pages per category URL
 # One-off backfill (manual workflow run): email every matching ad posted in the
 # last N days, even ones already in seen.json. Unset/0 for normal runs.
 BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS") or "0")
+# Dry run: log what would be emailed (plus page structure) without sending
+# email or updating seen.json.
+DRY_RUN = (os.getenv("DRY_RUN") or "").strip().lower() in ("1", "true", "yes")
 
 URLS_FILE = os.getenv("URLS_FILE", "urls.txt")
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
@@ -101,8 +104,17 @@ SOLD_DESC_PHRASE_RE = re.compile(
 def is_sold(ad: "AdDetail") -> bool:
     if ad.sold_marker or SOLD_TITLE_RE.search(ad.title or ""):
         return True
-    desc = ad.description or ""
-    return bool(SOLD_DESC_SHOUT_RE.search(desc) or SOLD_DESC_PHRASE_RE.search(desc))
+    # raw_text covers the whole ad block (price line, badges), not just the body
+    for text in (ad.description or "", ad.raw_text or ""):
+        if SOLD_DESC_SHOUT_RE.search(text) or SOLD_DESC_PHRASE_RE.search(text):
+            return True
+    return False
+
+
+def sold_context(ad: "AdDetail") -> List[str]:
+    """Snippets around any "sold" in the ad block, for diagnosing is_sold()."""
+    text = ad.raw_text or ad.description or ""
+    return [text[max(0, m.start() - 30): m.end() + 30] for m in re.finditer(r"sold", text, re.IGNORECASE)][:3]
 
 
 # ---------- Models ----------
@@ -119,6 +131,7 @@ class AdDetail:
     description: Optional[str] = None
     images: Tuple[str, ...] = field(default_factory=tuple)
     sold_marker: bool = False  # site-level "sold" badge/class on the ad block
+    raw_text: str = field(default="", repr=False)  # full text of the ad block
 
 
 # ---------- IO helpers ----------
@@ -186,6 +199,10 @@ POSTED_RE = re.compile(r"\bPosted\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})\b")
 LOC_IN_BODY_RE = re.compile(r"\b([A-Za-z .'-]+,\s*[A-Z]{2})\b")  # "Bisbee, AZ"
 LOC_IN_CONTACT_RE = re.compile(r"\blocated\s+(.+?)\s+United States\b", re.IGNORECASE)
 DOLLAR_RE = re.compile(r"\$\s*[\d,]+(?:\.\d{2})?")
+
+# Stock "no photo" placeholders the site serves for ads without pictures
+NO_IMAGE_RE = re.compile(r"no[_-]?(?:image|photo|pic)|placeholder|blank\.(?:gif|png|jpe?g)|spacer", re.IGNORECASE)
+
 
 def thumbnail_to_large(url: str) -> str:
     """
@@ -316,7 +333,7 @@ def parse_classified_single(div) -> Optional[AdDetail]:
     imgs = []
     for img in div.select("img.thumbnail[src]"):
         src = (img.get("src") or "").strip()
-        if not src:
+        if not src or NO_IMAGE_RE.search(src):
             continue
         imgs.append(thumbnail_to_large(src))
 
@@ -329,12 +346,16 @@ def parse_classified_single(div) -> Optional[AdDetail]:
             images.append(u)
     images = images[:6]
 
-    # Sold badge: any class, image src or alt text in the block mentioning "sold"
+    # Sold badge: any class, image src or alt text in the block mentioning
+    # "sold" (letters-only boundaries so "classified_sold" / "sold-badge" count)
+    sold_word = re.compile(r"(?<![a-z])sold(?![a-z])", re.IGNORECASE)
     sold_marker = any(
-        re.search(r"\bsold\b", " ".join(el.get("class") or []), re.IGNORECASE)
-        for el in div.find_all(class_=True)
+        sold_word.search(" ".join(el.get("class") or []))
+        for el in [div] + div.find_all(class_=True)
+    ) or bool(
+        price_span and re.search(r"\bsold\b", price_span.get_text(" ", strip=True), re.IGNORECASE)
     ) or any(
-        re.search(r"(?<![a-z])sold(?![a-z])", f"{img.get('src') or ''} {img.get('alt') or ''}", re.IGNORECASE)
+        sold_word.search(f"{img.get('src') or ''} {img.get('alt') or ''}")
         for img in div.find_all("img")
     )
 
@@ -348,6 +369,7 @@ def parse_classified_single(div) -> Optional[AdDetail]:
         description=description,
         images=tuple(images),
         sold_marker=sold_marker,
+        raw_text=div_text,
     )
 
 YELLOW_TAG_RE = re.compile(r"\byellow[\s-]*tag\b|\b8130\b|\boverhaul(ed)?\b", re.IGNORECASE)
@@ -474,6 +496,7 @@ def enrich_from_classified_page(ad: AdDetail) -> AdDetail:
                 description=parsed.description or ad.description,
                 images=parsed.images or ad.images,
                 sold_marker=parsed.sold_marker or ad.sold_marker,
+                raw_text=parsed.raw_text or ad.raw_text,
             )
 
     # If we couldn't find the structured block, just return original.
@@ -545,9 +568,8 @@ def render_card(ad: AdDetail) -> str:
         </a>
         """
     else:
-        hero_html = """
-        <div style="width:100%;border-radius:12px;background:#eee;height:180px;"></div>
-        """
+        # No photo: leave the image area out entirely rather than a blank box
+        hero_html = ""
 
     meta = []
     if loc:
@@ -656,6 +678,15 @@ def main() -> int:
                     if re.search(r"[?&]page=\d", a["href"])
                 })
                 print(f"Pagination links on {page_url}: {page_links[:5] or 'none'}")
+                if DRY_RUN:
+                    cat_links = sorted({
+                        (a["href"], a.get_text(" ", strip=True)[:40])
+                        for a in BeautifulSoup(html, "lxml").find_all("a", href=True)
+                        if re.search(r"catid=\d|category-\d|Classifieds\.htm|main=", a["href"])
+                    })
+                    print(f"Category links on {page_url} ({len(cat_links)}):")
+                    for href, text in cat_links[:80]:
+                        print(f"  {href}  [{text}]")
             fresh = {aid: ad for aid, ad in ads.items() if aid not in url_ids}
             if not fresh:
                 if page == 1:
@@ -689,6 +720,12 @@ def main() -> int:
     all_new_ids = [ad.ad_id for ad in new_ads]
     new_ads = [ad for ad in new_ads if watch_matches(ad.title, ad.description)]
     print(f"{len(new_ads)} of {len(all_new_ids)} new ads match the watch list.")
+    if DRY_RUN:
+        for ad in new_ads:
+            print(f"Match: {ad.title} | {ad.price} | posted {ad.posted} | sold={is_sold(ad)} | {ad.url}")
+            print(f"    images: {list(ad.images) or 'none'}")
+            for snip in sold_context(ad):
+                print(f"    sold context: ...{snip}...")
     for ad in [ad for ad in new_ads if is_sold(ad)]:
         print(f"Skipping sold: {ad.title} ({ad.url})")
     new_ads = [ad for ad in new_ads if not is_sold(ad)]
@@ -732,6 +769,12 @@ def main() -> int:
         details = kept
 
     # If everything got filtered out, don't email; still mark as seen so you don't keep reprocessing
+    if DRY_RUN:
+        print(f"Dry run: would email {len(details)} ads; not sending or updating {SEEN_FILE}.")
+        for ad in details:
+            print(f"  would email: {ad.title} | {ad.price} | posted {ad.posted} | {ad.url}")
+        return 0
+
     if not details:
         print(f"No new ads after filtering (MIN_PRICE={MIN_PRICE}).")
         seen.update(all_new_ids)
@@ -744,7 +787,7 @@ def main() -> int:
     details = sort_best_first(details)
 
     # Text fallback can still be newest-first or also quality-sorted; your call.
-    text_body = build_digest_text(new_ads)
+    text_body = build_digest_text(details)
     html_body = build_digest_html(details)
 
     send_email_gmail_smtp(
