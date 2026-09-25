@@ -46,6 +46,9 @@ DEFAULT_BLACKLIST_TITLE_KEYWORDS = [
     "com repair",
     "gps repair",
     "repair service",
+    # Buyer ads ("WANTED AVIONICS", "WTB SL40"), not units for sale
+    "wanted",
+    "wtb",
 ]
 
 
