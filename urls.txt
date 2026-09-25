@@ -4,5 +4,3 @@
 https://www.barnstormers.com/listing.php?catid=16591
 # Avionics > Radio
 https://www.barnstormers.com/category-16694-Avionics--Radio.html
-# All avionics, most recent (catch-all for miscategorized ads)
-https://www.barnstormers.com/ad_manager/listing.php?main=avionics
