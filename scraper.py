@@ -31,6 +31,10 @@ DRY_RUN = (os.getenv("DRY_RUN") or "").strip().lower() in ("1", "true", "yes")
 
 URLS_FILE = os.getenv("URLS_FILE", "urls.txt")
 SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
+# IDs of watch-list matches already handled (emailed, or skipped as sold).
+# Separate from seen.json so an ad that was seen before it mentioned a
+# watched radio (seller edited/reposted it) still gets emailed once.
+NOTIFIED_FILE = os.getenv("NOTIFIED_FILE", "notified.json")
 
 # Title substrings that mark an ad as a recurring service listing rather than
 # an actual aircraft/part for sale, so it's dropped before ever reaching "new"
@@ -703,6 +707,16 @@ def build_digest_html(details: List[AdDetail]) -> str:
 
 # ---------- Main ----------
 
+def save_state(seen: Set[str], new_ids: Iterable[str], notified: Set[str], matched_ids: Iterable[str]) -> None:
+    seen.update(new_ids)
+    trimmed = trim_seen_ids(seen, SEEN_CAP)
+    save_seen(SEEN_FILE, trimmed)
+    print(f"Updated {SEEN_FILE} (kept {len(trimmed)} ids).")
+    notified.update(matched_ids)
+    save_seen(NOTIFIED_FILE, trim_seen_ids(notified, SEEN_CAP))
+    print(f"Updated {NOTIFIED_FILE} ({len(notified)} ids).")
+
+
 def main() -> int:
     urls = read_urls(URLS_FILE)
     if not urls:
@@ -711,6 +725,7 @@ def main() -> int:
 
     seen_list = load_seen(SEEN_FILE)
     seen: Set[str] = set(seen_list)
+    notified: Set[str] = set(load_seen(NOTIFIED_FILE))
 
     all_ads: Dict[str, AdDetail] = {}
 
@@ -728,7 +743,13 @@ def main() -> int:
         print(f"Backfill mode: including already-seen ads posted in the last {BACKFILL_DAYS} days.")
         new_ads = list(all_ads.values())
     else:
-        new_ads = [ad for ad_id, ad in all_ads.items() if ad_id not in seen]
+        # Unseen ads, plus seen ads that now match but were never notified
+        # (e.g. a reposted ad whose text newly mentions a watched radio).
+        new_ads = [
+            ad for ad_id, ad in all_ads.items()
+            if ad_id not in seen
+            or (ad_id not in notified and watch_matches(ad.title, ad.description))
+        ]
 
     if not new_ads:
         print("No new ads.")
@@ -740,6 +761,7 @@ def main() -> int:
     # marked seen below so they're never re-checked.
     all_new_ids = [ad.ad_id for ad in new_ads]
     new_ads = [ad for ad in new_ads if watch_matches(ad.title, ad.description)]
+    matched_ids = [ad.ad_id for ad in new_ads]
     print(f"{len(new_ads)} of {len(all_new_ids)} new ads match the watch list.")
     if DRY_RUN:
         for ad in new_ads:
@@ -791,17 +813,14 @@ def main() -> int:
 
     # If everything got filtered out, don't email; still mark as seen so you don't keep reprocessing
     if DRY_RUN:
-        print(f"Dry run: would email {len(details)} ads; not sending or updating {SEEN_FILE}.")
+        print(f"Dry run: would email {len(details)} ads; not sending or updating {SEEN_FILE}/{NOTIFIED_FILE}.")
         for ad in details:
             print(f"  would email: {ad.title} | {ad.price} | posted {ad.posted} | {ad.url}")
         return 0
 
     if not details:
         print(f"No new ads after filtering (MIN_PRICE={MIN_PRICE}).")
-        seen.update(all_new_ids)
-        trimmed = trim_seen_ids(seen, SEEN_CAP)
-        save_seen(SEEN_FILE, trimmed)
-        print(f"Updated {SEEN_FILE} (kept {len(trimmed)} ids).")
+        save_state(seen, all_new_ids, notified, matched_ids)
         return 0
 
     # Sort email cards by quality (best first)
@@ -818,11 +837,9 @@ def main() -> int:
     )
     print("Email sent via Gmail SMTP.")
 
-    # Update seen IDs (mark ALL new ads as seen, even if filtered out, to prevent repeat noise)
-    seen.update(all_new_ids)
-    trimmed = trim_seen_ids(seen, SEEN_CAP)
-    save_seen(SEEN_FILE, trimmed)
-    print(f"Updated {SEEN_FILE} (kept {len(trimmed)} ids).")
+    # Mark ALL new ads as seen and all matches as notified, even if filtered
+    # out, to prevent repeat noise
+    save_state(seen, all_new_ids, notified, matched_ids)
 
     return 0
 
